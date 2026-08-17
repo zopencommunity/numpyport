@@ -1,0 +1,31 @@
+Use the no-TLS definition of NPY_TLS on z/OS.
+
+evil_global_disable_warn_O4O8_flag is declared NPY_TLS, which expands to
+thread_local. On z/OS a thread-local symbol cannot be resolved across the DLL
+boundary: the binder reports
+
+    IEW2456E SYMBOL evil_global_disable_warn_O4O8_flag@tls@ UNRESOLVED
+
+and _multiarray_umath fails to link, after every other target has built.
+
+numpy already keeps an empty NPY_TLS for platforms without thread-local
+support, so z/OS uses that. The flag becomes process-global rather than
+per-thread, which is what those platforms already get.
+
+diff --git a/numpy/_core/include/numpy/npy_common.h b/numpy/_core/include/numpy/npy_common.h
+--- a/numpy/_core/include/numpy/npy_common.h
++++ b/numpy/_core/include/numpy/npy_common.h
+@@ -125,7 +125,12 @@
+     #define NPY_NOINLINE static
+ #endif
+ 
+-#ifdef __cplusplus
++#if defined(__MVS__)
++    /* z/OS: a thread-local symbol cannot be resolved across the DLL boundary --
++       the binder reports it as name@tls@ UNRESOLVED -- so use the same empty
++       definition as platforms without TLS. */
++    #define NPY_TLS
++#elif defined(__cplusplus)
+     #define NPY_TLS thread_local
+ #elif defined(HAVE_THREAD_LOCAL)
+     #define NPY_TLS thread_local

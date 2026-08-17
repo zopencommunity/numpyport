@@ -1,0 +1,25 @@
+Do not take the Linux-on-Z path on z/OS.
+
+numpy treats __s390x__ as implying Linux on Z: it includes <sys/auxv.h> and
+reads CPU features from the auxiliary vector via getauxval(AT_HWCAP). z/OS is
+s390x but has no auxiliary vector and ships no sys/auxv.h, so the branch cannot
+compile there -- "fatal error: 'sys/auxv.h' file not found".
+
+Excluding z/OS lets it fall through to the unsupported-arch path that numpy
+already maintains, which reports no CPU features rather than failing to build.
+
+diff --git a/numpy/_core/src/common/npy_cpu_features.c b/numpy/_core/src/common/npy_cpu_features.c
+--- a/numpy/_core/src/common/npy_cpu_features.c
++++ b/numpy/_core/src/common/npy_cpu_features.c
+@@ -714,7 +714,10 @@
+ 
+ /***************** ZARCH ******************/
+ 
+-#elif defined(__s390x__)
++#elif defined(__s390x__) && !defined(__MVS__)
++/* z/OS is s390x but has no auxiliary vector: no sys/auxv.h and no getauxval(),
++   so it falls through to the unsupported-arch path below, which reports no CPU
++   features rather than failing to compile. */
+ 
+ #include <sys/auxv.h>
+ 

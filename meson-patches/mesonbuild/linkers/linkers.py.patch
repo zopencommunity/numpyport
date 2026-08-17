@@ -1,0 +1,57 @@
+diff --git i/mesonbuild/linkers/linkers.py w/mesonbuild/linkers/linkers.py
+index 176fb33..8ceb611 100644
+--- i/mesonbuild/linkers/linkers.py
++++ w/mesonbuild/linkers/linkers.py
+@@ -291,7 +291,7 @@ class DynamicLinker(metaclass=abc.ABCMeta):
+         return []
+ 
+     def get_archive_name(self, filename: str) -> str:
+-        #Only used by AIX.
++        #Only used by AZOSDynamicLinkerIX.
+         return str()
+ 
+     def get_command_to_archive_shlib(self) -> T.List[str]:
+@@ -394,6 +394,10 @@ class ArLinker(ArLikeLinker, StaticLinker):
+             return self.std_args
+ 
+ 
++class ZOSArLinker(ArLinker):
++    id = "zar"
++
++
+ class AppleArLinker(ArLinker):
+ 
+     # mostly this is used to determine that we need to call ranlib
+@@ -1571,6 +1575,32 @@ class AIXDynamicLinker(PosixDynamicLinkerMixin, DynamicLinker):
+         return ['-pthread']
+ 
+ 
++class ZOSDynamicLinker(PosixDynamicLinkerMixin, DynamicLinker):
++
++    """z/OS clang implementation."""
++
++    id = "clang++"
++
++    @staticmethod
++    def parse_version() -> str:
++        version_cmd = ['clang++', '--version']
++        try:
++            _, out, _ = mesonlib.Popen_safe(version_cmd)
++        except OSError:
++            return 'unknown version'
++        return out.strip().rsplit('V', maxsplit=1)[-1]
++
++    def get_accepts_rsp(self) -> bool:
++        return False
++
++    def get_allow_undefined_args(self) -> T.List[str]:
++        return []
++
++    def get_soname_args(self, prefix: str, shlib_name: str,
++                        suffix: str, soversion: str, darwin_versions: T.Tuple[str, str]) -> T.List[str]:
++        return []
++
++
+ class OptlinkDynamicLinker(VisualStudioLikeLinkerMixin, DynamicLinker):
+ 
+     """Digital Mars dynamic linker for windows."""

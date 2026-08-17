@@ -1,0 +1,59 @@
+diff --git a/mesonbuild/envconfig.py b/mesonbuild/envconfig.py
+index 8eeb30f46..1ddac0b05 100644
+--- a/mesonbuild/envconfig.py
++++ b/mesonbuild/envconfig.py
+@@ -523,6 +523,7 @@ KERNEL_MAPPINGS: T.Mapping[str, str] = {'freebsd': 'freebsd',
+                                         'dragonfly': 'dragonfly',
+                                         'haiku': 'haiku',
+                                         'gnu': 'gnu',
++                                        'zos': 'zos',
+                                         }
+ 
+ def detect_windows_arch(compilers: CompilerDict) -> str:
+@@ -587,6 +588,8 @@ def detect_cpu_family(compilers: CompilerDict) -> str:
+         trial = detect_windows_arch(compilers)
+     elif mesonlib.is_freebsd() or mesonlib.is_netbsd() or mesonlib.is_openbsd() or mesonlib.is_qnx() or mesonlib.is_aix():
+         trial = platform.processor().lower()
++    elif mesonlib.is_zos():
++        trial = 's390x'
+     else:
+         trial = platform.machine().lower()
+     if trial.startswith('i') and trial.endswith('86'):
+@@ -653,6 +656,8 @@ def detect_cpu(compilers: CompilerDict) -> str:
+         trial = detect_windows_arch(compilers)
+     elif mesonlib.is_freebsd() or mesonlib.is_netbsd() or mesonlib.is_openbsd() or mesonlib.is_aix():
+         trial = platform.processor().lower()
++    elif mesonlib.is_zos():
++        trial = 's390x'
+     else:
+         trial = platform.machine().lower()
+ 
+@@ -719,6 +724,8 @@ def detect_subsystem(system: str) -> T.Optional[str]:
+ def detect_system() -> str:
+     if sys.platform == 'cygwin':
+         return 'cygwin'
++    if sys.platform == 'zos':
++        return 'zos'
+     return platform.system().lower()
+ 
+ def detect_msys2_arch() -> T.Optional[str]:
+@@ -761,4 +768,5 @@ def machine_info_can_run(machine_info: MachineInfo) -> bool:
+     return \
+         (machine_info.cpu_family == true_build_cpu_family) or \
+         ((true_build_cpu_family == 'x86_64') and (machine_info.cpu_family == 'x86')) or \
+-        ((true_build_cpu_family == 'mips64') and (machine_info.cpu_family == 'mips'))
++        ((true_build_cpu_family == 'mips64') and (machine_info.cpu_family == 'mips')) or \
++        ((true_build_cpu_family == 's390x') and (machine_info.cpu_family == 's390'))
+diff --git a/mesonbuild/environment.py b/mesonbuild/environment.py
+index 76d75ebc1..66a108f99 100644
+--- a/mesonbuild/environment.py
++++ b/mesonbuild/environment.py
+@@ -575,6 +575,8 @@ class Environment:
+                 extra_paths.update(library_paths)
+             elif self.machines.host.is_darwin():
+                 env.prepend('DYLD_LIBRARY_PATH', list(library_paths))
++            elif self.machines.host.is_zos():
++                env.prepend('LIBPATH', list(library_paths))
+             else:
+                 env.prepend('LD_LIBRARY_PATH', list(library_paths))
+         if extra_paths:

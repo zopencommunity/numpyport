@@ -1,0 +1,522 @@
+# bump: numpy-version /NUMPY_VERSION="(.*)"/ https://github.com/numpy/numpy.git|semver:*
+NUMPY_VERSION="2.5.2"
+
+###
+### Build control file for numpyport
+###
+### numpy is the highest-leverage Python port remaining on z/OS: pandas, scipy,
+### matplotlib, scikit-learn and most of the scientific stack sit on top of it.
+###
+### It builds here with no BLAS. numpy's meson.options sets allow-noblas=true by
+### default, so linear algebra falls back to the bundled lapack_lite -- slow, but
+### correct, and numpy.linalg works. Pairing BLIS (already ported, BLAS only) with
+### a reference LAPACK built by XL Fortran is the follow-on for performance; it is
+### deliberately not attempted here, because a working numpy unblocks far more
+### than a fast one.
+###
+### Four z/OS problems are handled below, none of them obvious from the failure
+### they produce:
+###
+###   1. meson. numpy does not merely pin meson, it vendors a fork of it --
+###      vendored-meson/meson is a submodule of numpy's own meson repo, carrying
+###      a `features` module for CPU dispatch that upstream meson does not have.
+###      The ported system meson therefore cannot stand in for it: substituting
+###      it fails at meson_cpu with 'Module "features" does not exist'. mesonport's
+###      z/OS support has to be applied to the vendored copy instead, which is
+###      what meson-patches/ is for. Without it the build stops at
+###      "ERROR: Unable to detect linker" before compiling anything.
+###
+###   2. String literal encoding. IBM's clang emits EBCDIC string literals by
+###      default, while the interpreter is an ASCII build. Extensions then compile,
+###      link and install perfectly and every one of them fails to import with
+###      UnicodeDecodeError, because their module names come back as EBCDIC.
+###      -fzos-le-char-mode=ascii is the flag that fixes it, and it has to be that
+###      flag rather than -fexec-charset: the latter changes the literals but not
+###      the Language Environment, so printf stops working and meson's configure
+###      probes start returning -1. setuptools passes these flags for extension
+###      builds; meson does not, which is why C ports do not hit this and this one
+###      does.
+###
+###   3. Python symbols. A z/OS extension must bind against libpython's side deck
+###      or every Py* symbol comes back UNRESOLVED from the binder.
+###
+###   4. File tags. numpy's sources are untagged ASCII; z/OS tools read them as
+###      EBCDIC and the compiler reports "unexpected character <U+0080>".
+###
+
+export ZOPEN_PROJECT_NAME="numpy"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_STABLE_URL="https://github.com/numpy/numpy.git"
+export ZOPEN_STABLE_TAG="v${NUMPY_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/numpy/numpy.git"
+
+# vendored-meson, highway and pocketfft are all submodules; without them the
+# build has no meson to run and no sources to compile.
+export ZOPEN_CLONE_SUBMODULES="yes"
+
+# patch supplies gpatch, which applies the vendored-meson patches below. Without
+# it those silently do not apply and the build fails much later, at meson
+# configure, with no mention of a missing tool.
+export ZOPEN_STABLE_DEPS="check_python meson ninja pkgconfig curl git patch"
+export ZOPEN_DEV_DEPS="check_python meson ninja pkgconfig curl git patch"
+export ZOPEN_RUNTIME_DEPS="check_python"
+export ZOPEN_CATEGORIES="development library math"
+
+export ZOPEN_PYTHON_VERSIONS="3.12 3.13 3.14"
+export ZOPEN_BUILD_SYSTEM="Python"
+
+# numpy is built by meson through meson-python, not by this port's own configure
+# or make, and nothing here compiles outside that.
+export ZOPEN_COMP="skip"
+export ZOPEN_CONFIGURE="skip"
+# The per-interpreter flags below cannot be set by the default build loop.
+export ZOPEN_MAKE="zopen_custom_build"
+
+# Passed to meson via meson-python. allow-noblas is the default but is stated so
+# that a future BLAS-enabled build is a visible change to this line rather than a
+# silent change in behaviour. disable-optimization turns off numpy's hand-written
+# SIMD dispatch, which targets Linux on Z rather than z/OS.
+NUMPY_MESON_ARGS="-Dallow-noblas=true -Ddisable-optimization=true"
+
+zopen_get_version() {
+  echo "${NUMPY_VERSION}"
+}
+
+# The flags an extension needs here, taken from what the interpreter itself uses
+# rather than written from scratch: sysconfig's CFLAGS plus the z/OS extension
+# flags setuptools adds. Read at build time so an interpreter upgrade does not
+# leave this file stating something that used to be true.
+_numpy_zos_flags() {
+  "$(_zopen_python_interpreter_path "$1")" -c '
+import sysconfig
+# What the interpreter was built with. Note _UNIX03_THREADS is in here and is
+# mutually exclusive with _OPEN_THREADS -- adding the latter is a compile error.
+base = sysconfig.get_config_var("CFLAGS") or ""
+# What setuptools adds for extensions on z/OS. -fzos-le-char-mode=ascii is the
+# load-bearing one; see the note at the top of this file.
+print(base + " -m64 -fvisibility=default -fzos-le-char-mode=ascii -fno-short-enums")
+'
+}
+
+# The directory actually holding libpython<version>.x.
+#
+# sysconfig's LIBDIR cannot be trusted: like the pkg-config files, it records
+# where the interpreter was built rather than where it lives. On these systems
+# 3.13 reports /usr/lpp/IBM/cyp/v3r13/pyz/lib while the side deck is only under
+# /data/usr/lpp/..., and 3.14 reports a path under IBM/python rather than
+# IBM/cyp. Passing the reported one produces
+#
+#     clang: error: no such file or directory: '.../libpython3.13.x'
+#
+# only for the interpreters whose reported path happens not to exist, which is
+# why 3.12 built and 3.13 did not. Prefer sys.base_prefix, which follows the
+# interpreter actually running, and verify before returning it.
+_numpy_python_libdir() {
+  "$(_zopen_python_interpreter_path "$1")" -c '
+import os
+import sys
+import sysconfig
+
+version = sysconfig.get_config_var("VERSION")
+candidates = [os.path.join(getattr(sys, "base_prefix", sys.prefix), "lib")]
+libdir = sysconfig.get_config_var("LIBDIR")
+if libdir:
+    candidates.append(libdir)
+
+for candidate in candidates:
+    if os.path.exists(os.path.join(candidate, "libpython%s.x" % version)):
+        print(candidate)
+        break
+else:
+    sys.exit("no libpython%s.x found in: %s" % (version, ", ".join(candidates)))
+'
+}
+
+# The compiler the interpreter was built with, as an absolute path.
+#
+# ZOPEN_COMP=skip means zopen-build provisions no compiler and puts none on
+# PATH, and meson then fails with "Unknown compiler(s): [ibm-clang, clang...]"
+# before doing anything. Taking it from sysconfig rather than naming one here
+# keeps the extensions built by the same compiler as the interpreter they load
+# into, which is what setuptools does for the ports that are not meson-based.
+_numpy_cc() {
+  "$(_zopen_python_interpreter_path "$1")" -c \
+    'import sysconfig; print(sysconfig.get_config_var("CC"))'
+}
+
+_numpy_cxx() {
+  "$(_zopen_python_interpreter_path "$1")" -c \
+    'import sysconfig; print(sysconfig.get_config_var("CXX") or (sysconfig.get_config_var("CC") + "++"))'
+}
+
+# Write a corrected python-<version>.pc and echo the directory holding it.
+#
+# The interpreters ship pkg-config files whose prefix is the machine they were
+# built on -- /home/pyzbld/buildbot/worker/... -- rather than where they are
+# installed. pkg-config therefore answers with an include directory that does
+# not exist, and meson concludes Python.h is missing:
+#
+#     Has header "Python.h" with dependency python-3.12: NO
+#     ERROR: Cannot compile `Python.h`. Perhaps you need to install python-dev
+#
+# All three interpreters are affected. setuptools-based ports never notice,
+# because they ask sysconfig; anything meson-built asks pkg-config and breaks.
+# Regenerating the file from sysconfig fixes the cause rather than working
+# around it in numpy's meson.build, so anything else the build consults
+# pkg-config for also gets real paths.
+_numpy_pkgconfig_dir() {
+  _pc_pv="$1"
+  _pc_dir="${PWD}/.zopen-pkgconfig/${_pc_pv}"
+  mkdir -p "${_pc_dir}" || return 1
+  "$(_zopen_python_interpreter_path "${_pc_pv}")" - "${_pc_dir}" <<'PCEOF'
+import os
+import sys
+import sysconfig
+
+out_dir = sys.argv[1]
+version = sysconfig.get_config_var("VERSION")
+prefix = getattr(sys, "base_prefix", sys.prefix)
+# Same caveat as _numpy_python_libdir: LIBDIR may name the build machine.
+libdir = os.path.join(getattr(sys, "base_prefix", sys.prefix), "lib")
+if not os.path.isdir(libdir):
+    libdir = sysconfig.get_config_var("LIBDIR") or os.path.join(prefix, "lib")
+# get_paths()["include"] is the real header directory; deriving it from prefix
+# would reintroduce the assumption that broke the shipped file.
+incdir = os.path.dirname(sysconfig.get_paths()["include"])
+
+with open(os.path.join(out_dir, "python-%s.pc" % version), "w") as fh:
+    fh.write(
+        "# Regenerated from sysconfig by numpyport: the shipped file names the\n"
+        "# machine this interpreter was built on, not where it is installed.\n"
+        "prefix=%s\n"
+        "exec_prefix=${prefix}\n"
+        "libdir=%s\n"
+        "includedir=%s\n"
+        "\n"
+        "Name: Python\n"
+        "Description: Build a C extension for Python\n"
+        "Requires:\n"
+        "Version: %s\n"
+        "Libs.private:\n"
+        "Libs: -L${libdir}\n"
+        "Cflags: -I${includedir}/python%s\n"
+        % (prefix, libdir, incdir, version, version))
+PCEOF
+  [ -f "${_pc_dir}/python-${_pc_pv}.pc" ] || return 1
+  echo "${_pc_dir}"
+}
+
+zopen_pre_build() {
+  _np_src="${ZOPEN_ROOT}/${ZOPEN_PROJECT_NAME}"
+  [ -d "${_np_src}" ] || _np_src="${PWD}"
+
+  # 1. Apply mesonport's z/OS support to the vendored meson fork.
+  #
+  # Not in patches/: zopen-build applies those with `git apply` from the source
+  # root, and vendored-meson/meson is a submodule -- a separate git repository --
+  # so git refuses paths inside it. gpatch does not care.
+  _np_mp="${ZOPEN_ROOT}/meson-patches"
+  _np_vm="${_np_src}/vendored-meson/meson"
+  if [ ! -d "${_np_vm}/mesonbuild" ]; then
+    printError "vendored-meson is missing; ZOPEN_CLONE_SUBMODULES=yes is required"
+  fi
+  if [ -d "${_np_mp}" ]; then
+    # GNU patch, not the system one: these patch files are ASCII and the z/OS
+    # patch utility reads them as EBCDIC, reporting "I can't seem to find a patch
+    # in there anywhere".
+    command -v gpatch > /dev/null 2>&1 \
+      || printError "gpatch not found; the patch dependency is required to apply the vendored meson patches"
+
+    # Tag first, for the same encoding reason: the target files are untagged
+    # ASCII and every z/OS tool reading them assumes EBCDIC.
+    _numpy_tag_sources "${_np_vm}"
+    for _np_p in $(find "${_np_mp}" -name "*.patch" | sort); do
+      _np_rel=$(echo "${_np_p}" | sed "s|${_np_mp}/||")
+      _np_out=$( (cd "${_np_vm}" && gpatch -p1 --forward --batch < "${_np_p}" 2>&1) )
+      if echo "${_np_out}" | grep -qi "previously applied"; then
+        printVerbose "Already applied: ${_np_rel}"
+      elif echo "${_np_out}" | grep -qiE "FAILED|malformed|can.t seem to find"; then
+        printSoftError "${_np_out}"
+        printError "Could not apply ${_np_rel} to the vendored meson"
+      else
+        printVerbose "Applied ${_np_rel} to vendored meson"
+      fi
+    done
+    if ! grep -q "ZOSDynamicLinker" "${_np_vm}/mesonbuild/linkers/linkers.py" 2> /dev/null; then
+      printError "vendored meson has no z/OS linker support; the build would fail at 'Unable to detect linker'"
+    fi
+    printInfo "Vendored meson carries z/OS linker support"
+  fi
+
+  # 2. Tag numpy's own sources, or the compiler reads ASCII as EBCDIC.
+  _numpy_tag_sources "${_np_src}"
+
+  return 0
+}
+
+# chtag every text source so z/OS tools read it as ASCII. Done by extension
+# rather than blanket, so nothing binary is mislabelled as text.
+_numpy_tag_sources() {
+  _nt_root="$1"
+  _nt_count=0
+  for _nt_ext in c cc cpp cxx h hh hpp inc pyx pxd pxi py build txt in src def; do
+    for _nt_f in $(find "${_nt_root}" -name "*.${_nt_ext}" -type f 2> /dev/null); do
+      chtag -tc ISO8859-1 "${_nt_f}" 2> /dev/null && _nt_count=$((_nt_count + 1))
+    done
+  done
+  printVerbose "Tagged ${_nt_count} source files under ${_nt_root}"
+}
+
+# Stands in for zopen-build's own Python build loop.
+#
+# The default loop is not usable here because the flags differ per interpreter:
+# each one binds against its own side deck (libpython3.12.x, libpython3.13.x...)
+# and reports its own CFLAGS. zopen_pre_build runs once and cannot set those.
+# Everything else the default does -- venv per interpreter, retag, stamp -- is
+# still done, by calling the same helpers in the same order.
+zopen_custom_build() {
+  _zopen_python_verify_interpreters || return 1
+  rm -rf dist
+
+  _nb_rc=0
+  for _nb_pv in $(_zopen_python_versions); do
+    printHeader "Building wheel with Python ${_nb_pv}"
+    _zopen_python_ensure_venv_for "${_nb_pv}" || { _nb_rc=1; break; }
+
+    # numpy's build backend. Installed into the venv rather than resolved by
+    # build isolation so the build uses the vendored meson patched above; an
+    # isolated environment would fetch its own copy of the backend.
+    pip install --disable-pip-version-check --quiet meson-python Cython \
+      || { _nb_rc=1; deactivate; break; }
+
+    # Ahead of the shipped one, which has unrelocated paths.
+    _nb_pc="$(_numpy_pkgconfig_dir "${_nb_pv}")" \
+      || { printSoftError "Could not write a corrected python-${_nb_pv}.pc"; _nb_rc=1; deactivate; break; }
+    PKG_CONFIG_PATH="${_nb_pc}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+    export PKG_CONFIG_PATH
+
+    CC="$(_numpy_cc "${_nb_pv}")"
+    CXX="$(_numpy_cxx "${_nb_pv}")"
+    export CC CXX
+    CFLAGS="$(_numpy_zos_flags "${_nb_pv}")"
+    CXXFLAGS="${CFLAGS}"
+    # Bind against this interpreter's side deck, or every Py* symbol comes back
+    # UNRESOLVED from the binder.
+    LDFLAGS="$(_numpy_python_libdir "${_nb_pv}")/libpython${_nb_pv}.x"
+    export CFLAGS CXXFLAGS LDFLAGS
+    printVerbose "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
+    printVerbose "CC=${CC}"
+    printVerbose "CFLAGS=${CFLAGS}"
+    printVerbose "LDFLAGS=${LDFLAGS}"
+
+    # shellcheck disable=SC2086
+    python -m build --wheel --no-isolation \
+      $(for _nb_a in ${NUMPY_MESON_ARGS}; do echo "-Csetup-args=${_nb_a}"; done)
+    _nb_rc=$?
+
+    # Retag before anything downstream sees the wheel, then stamp -- same order
+    # as the default loop, for the same reasons.
+    if [ ${_nb_rc} -eq 0 ]; then
+      _zopen_python_retag_wheel
+      _nb_rc=$?
+    fi
+    if [ ${_nb_rc} -eq 0 ]; then
+      _zopen_python_stamp_wheel
+      _nb_rc=$?
+    fi
+
+    deactivate
+    [ ${_nb_rc} -eq 0 ] || break
+  done
+
+  return ${_nb_rc}
+}
+
+zopen_python_test() {
+  NUMPY_EXPECTED_VERSION="${NUMPY_VERSION}" python - <<'PYEOF'
+import os
+import sys
+import tempfile
+
+# Exercise the installed wheel, not the checkout.
+#
+# The check runs from the source directory, and numpy's repository has the
+# numpy/ package at its root, so an unqualified import finds the source tree --
+# which has no compiled extensions -- and fails with
+#
+#     cannot import name 'version' from partially initialized module 'numpy'
+#
+# which reads like a broken wheel rather than the wrong numpy.
+#
+# Dropping "" from sys.path is not enough, and neither is chdir. zopen's
+# environment leaves PYTHONPATH with a leading empty entry --
+#
+#     PYTHONPATH=:/data/zopen/usr/local/zopen/cryptography/...
+#
+# because the ports build it up as "${PYTHONPATH}:..." from an unset variable.
+# Python expands that empty entry to the working directory *at interpreter
+# startup* and puts it on sys.path as an absolute path, so by the time this
+# script runs there is nothing named "" left to filter and moving out of the
+# directory changes nothing. Remove the source directory by name instead.
+_src = os.path.realpath(os.getcwd())
+os.chdir(tempfile.gettempdir())
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.realpath(p) != _src]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    import numpy as np
+except ImportError as exc:
+    # The failure this port exists to prevent looks exactly like this, and the
+    # message names Unicode rather than the compiler: extensions built with
+    # EBCDIC string literals import as mojibake. Report rather than crash, so
+    # zopen_check_results sees a count.
+    print("FAIL: import numpy -", exc, file=sys.stderr)
+    print("numpy FAILED to import on Python %s -- 0 passed, 1 failed"
+          % sys.version.split()[0])
+    sys.exit(1)
+
+check("version is the one this port builds",
+      lambda: np.__version__ == os.environ["NUMPY_EXPECTED_VERSION"])
+
+check("arithmetic on float64 arrays",
+      lambda: list(np.array([1., 2.]) + np.array([10., 20.])) == [11., 22.])
+
+check("dot product", lambda: float(np.array([1., 2., 3.]) @ np.array([4., 5., 6.])) == 32.0)
+
+
+def matmul():
+    m = np.arange(9.).reshape(3, 3)
+    return float(np.trace(m @ m)) == 180.0
+
+
+check("matrix multiply and trace", matmul)
+
+check("reductions", lambda: (float(np.array([1., 2., 3., 4.]).sum()) == 10.0
+                             and float(np.array([1., 2., 3., 4.]).mean()) == 2.5))
+
+# linalg is the bundled lapack_lite fallback -- the part most likely to be wrong
+# on a platform with no BLAS, and the reason allow-noblas is worth testing.
+A = np.array([[3., 1.], [1., 2.]])
+
+
+def solve():
+    x = np.linalg.solve(A, np.array([9., 8.]))
+    return bool(np.allclose(x, [2., 3.]))
+
+
+check("linalg.solve", solve)
+check("linalg.det", lambda: abs(float(np.linalg.det(A)) - 5.0) < 1e-9)
+check("linalg.inv", lambda: bool(np.allclose(A @ np.linalg.inv(A), np.eye(2))))
+check("linalg.eigvalsh", lambda: bool(np.allclose(sorted(np.linalg.eigvalsh(A)),
+                                                 [1.3819660112501051, 3.618033988749895])))
+
+
+def qr():
+    q, r = np.linalg.qr(A)
+    return bool(np.allclose(q @ r, A))
+
+
+check("linalg.qr reconstructs", qr)
+
+
+def svd():
+    u, s, vt = np.linalg.svd(A)
+    return bool(np.allclose(u @ np.diag(s) @ vt, A))
+
+
+check("linalg.svd reconstructs", svd)
+
+check("fft", lambda: abs(float(np.fft.fft(np.arange(8.))[0].real) - 28.0) < 1e-9)
+
+check("random generator",
+      lambda: abs(float(np.random.default_rng(42).normal(size=10000).mean())) < 0.05)
+
+
+def byte_order():
+    # z/OS is big-endian, which numpy supports but few builds exercise. The
+    # native dtype must be big-endian and a byteswapped copy must compare equal
+    # while differing in memory.
+    n = np.array([1, 2, 3], dtype=np.int32)
+    swapped = n.astype(n.dtype.newbyteorder())
+    return (sys.byteorder == "big"
+            and n.tobytes()[:4] == b"\x00\x00\x00\x01"
+            and bool((swapped == n).all())
+            and swapped.tobytes()[:4] == b"\x01\x00\x00\x00")
+
+
+check("big-endian layout and byteswap round trip", byte_order)
+
+check("sort and argsort", lambda: (list(np.sort([3, 1, 2])) == [1, 2, 3]
+                                   and list(np.argsort([3, 1, 2])) == [1, 2, 0]))
+
+print()
+print("numpy %s on Python %s  --  %d passed, %d failed" % (
+    np.__version__, sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224.
+  passed=$(grep -c "^PASS:" "${chk}" 2> /dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2> /dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+
+  # An interpreter whose script dies before the first check contributes no PASS
+  # and no FAIL, so counting those alone would score a crash as a clean run.
+  interpreters=$(grep -c "Running tests with Python" "${chk}" 2> /dev/null)
+  reported=$(grep -c "^numpy .* on Python" "${chk}" 2> /dev/null)
+  interpreters=${interpreters:-0}
+  reported=${reported:-0}
+  silent=$((interpreters - reported))
+  if [ "${silent}" -gt 0 ]; then
+    failed=$((failed + silent))
+  fi
+
+  total=$((passed + failed))
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_post_install() {
+  # zopen packages ZOPEN_INSTALL_DIR into a pax; the executable bit on the
+  # extensions has to survive that, or they fail to HFS-load with
+  # CEE3512S ... reason code EF076015, which reads like a missing symbol.
+  for _np_so in $(find "${ZOPEN_INSTALL_DIR}/lib/python" -name "*.so" 2> /dev/null); do
+    chmod +x "${_np_so}"
+  done
+  return 0
+}
+
+zopen_append_to_env() {
+  cat <<'EOF'
+PYTHONPATH="${PYTHONPATH}:${PWD}/lib/python"
+export PYTHONPATH="$(deleteDuplicateEntries "$PYTHONPATH" ":")"
+EOF
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"import numpy; a = numpy.array([1.0, 2.0, 3.0]); assert float(a @ a) == 14.0; assert abs(float(numpy.linalg.det(numpy.array([[3.0,1.0],[1.0,2.0]]))) - 5.0) < 1e-9; print('numpy', numpy.__version__, 'with working linalg')\""
+}
