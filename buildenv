@@ -519,17 +519,22 @@ zopen_post_install() {
   # which reads as a corrupt binary rather than a dead shebang. scipy hits this
   # through meson's dependency('numpy'), which runs numpy-config.
   #
-  # Point them at the primary interpreter by absolute path. "/usr/bin/env
-  # python3" is the obvious alternative and does not work: a zopen environment
-  # puts no python3 on PATH, so the scripts stay unrunnable. These scripts only
-  # report paths and versions, so the choice of interpreter among the ones this
-  # port builds for does not matter.
+  # Two things are needed to make these runnable, and each was established by
+  # testing rather than assumed:
   #
-  # Byte-level, because the scripts are ASCII while the shell here is EBCDIC.
+  #   1. An absolute interpreter path. "/usr/bin/env python3" does not work
+  #      because a zopen environment puts no python3 on PATH at all.
+  #
+  #   2. EBCDIC content with an IBM-1047 tag. z/OS only honours the shebang of
+  #      an ASCII-tagged script when _BPXK_AUTOCVT=ON, which a consumer may not
+  #      have set; the shell then tries to run it as a shell script and reports
+  #      "FSUM7332 syntax error: got (, expecting Newline". An EBCDIC-tagged
+  #      script works either way, and this Python reads it correctly.
   _np_interp=$(_zopen_python_interpreter_path "$(_zopen_python_primary_version)") \
     || printError "could not resolve the primary interpreter for the shebangs"
   for _np_script in "${ZOPEN_INSTALL_DIR}/lib/python/bin/"*; do
     [ -f "${_np_script}" ] || continue
+    # Byte-level: the scripts are ASCII and the shell here is EBCDIC.
     "${_np_interp}" -c 'import sys
 path, interp = sys.argv[1], sys.argv[2]
 data = open(path, "rb").read()
@@ -541,14 +546,22 @@ if end == -1:
 open(path, "wb").write(b"#!" + interp.encode() + data[end:])
 ' "${_np_script}" "${_np_interp}" \
       || printError "could not rewrite the shebang in ${_np_script}"
-    chtag -tc ISO8859-1 "${_np_script}"
+    iconv -f ISO8859-1 -t IBM-1047 "${_np_script}" > "${_np_script}.ebcdic" \
+      && mv "${_np_script}.ebcdic" "${_np_script}" \
+      || printError "could not convert ${_np_script} for execution"
+    chtag -tc IBM-1047 "${_np_script}"
     chmod +x "${_np_script}"
   done
 
-  # Prove it: a shebang that does not resolve fails only in a consumer's build.
+  # Prove it, both ways round: a shebang that does not resolve, or a tag that
+  # stops it being honoured, fails only in a consumer's build.
   if [ -f "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" ]; then
-    "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" --version > /dev/null 2>&1 \
-      || printError "numpy-config does not run after rewriting its shebang"
+    PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" _BPXK_AUTOCVT=ON \
+      "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" --version > /dev/null 2>&1 \
+      || printError "numpy-config does not run (autoconvert on)"
+    PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" \
+      "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" --version > /dev/null 2>&1 \
+      || printError "numpy-config does not run without autoconvert"
   fi
   return 0
 }
