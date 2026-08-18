@@ -519,29 +519,34 @@ zopen_post_install() {
   # which reads as a corrupt binary rather than a dead shebang. scipy hits this
   # through meson's dependency('numpy'), which runs numpy-config.
   #
-  # Rewrite to resolve at runtime instead. These scripts are shared by every
-  # interpreter this port installs for, so naming one of them absolutely would
-  # be wrong for the others.
+  # Point them at the primary interpreter by absolute path. "/usr/bin/env
+  # python3" is the obvious alternative and does not work: a zopen environment
+  # puts no python3 on PATH, so the scripts stay unrunnable. These scripts only
+  # report paths and versions, so the choice of interpreter among the ones this
+  # port builds for does not matter.
   #
   # Byte-level, because the scripts are ASCII while the shell here is EBCDIC.
+  _np_interp=$(_zopen_python_interpreter_path "$(_zopen_python_primary_version)") \
+    || printError "could not resolve the primary interpreter for the shebangs"
   for _np_script in "${ZOPEN_INSTALL_DIR}/lib/python/bin/"*; do
     [ -f "${_np_script}" ] || continue
-    python3 -c 'import sys
-path = sys.argv[1]
+    "${_np_interp}" -c 'import sys
+path, interp = sys.argv[1], sys.argv[2]
 data = open(path, "rb").read()
 if not data.startswith(b"#!"):
     sys.exit(0)
 end = data.find(b"\n")
 if end == -1:
     sys.exit(0)
-open(path, "wb").write(b"#!/usr/bin/env python3" + data[end:])
-' "${_np_script}" || printError "could not rewrite the shebang in ${_np_script}"
+open(path, "wb").write(b"#!" + interp.encode() + data[end:])
+' "${_np_script}" "${_np_interp}" \
+      || printError "could not rewrite the shebang in ${_np_script}"
     chtag -tc ISO8859-1 "${_np_script}"
     chmod +x "${_np_script}"
   done
 
   # Prove it: a shebang that does not resolve fails only in a consumer's build.
-  if [ -x "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" ]; then
+  if [ -f "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" ]; then
     "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" --version > /dev/null 2>&1 \
       || printError "numpy-config does not run after rewriting its shebang"
   fi
