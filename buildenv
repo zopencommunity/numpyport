@@ -507,6 +507,44 @@ zopen_post_install() {
   for _np_so in $(find "${ZOPEN_INSTALL_DIR}/lib/python" -name "*.so" 2> /dev/null); do
     chmod +x "${_np_so}"
   done
+
+  # pip writes console scripts with a shebang naming the interpreter it
+  # installed from -- here the build venv, which is deleted when the build ends.
+  # numpy-config and f2py therefore ship pointing at a path that exists on no
+  # machine, and any consumer gets
+  #
+  #   ERROR: Failed running '.../bin/numpy-config', binary or interpreter not
+  #   executable. Possibly wrong architecture or the executable bit is not set.
+  #
+  # which reads as a corrupt binary rather than a dead shebang. scipy hits this
+  # through meson's dependency('numpy'), which runs numpy-config.
+  #
+  # Rewrite to resolve at runtime instead. These scripts are shared by every
+  # interpreter this port installs for, so naming one of them absolutely would
+  # be wrong for the others.
+  #
+  # Byte-level, because the scripts are ASCII while the shell here is EBCDIC.
+  for _np_script in "${ZOPEN_INSTALL_DIR}/lib/python/bin/"*; do
+    [ -f "${_np_script}" ] || continue
+    python3 -c 'import sys
+path = sys.argv[1]
+data = open(path, "rb").read()
+if not data.startswith(b"#!"):
+    sys.exit(0)
+end = data.find(b"\n")
+if end == -1:
+    sys.exit(0)
+open(path, "wb").write(b"#!/usr/bin/env python3" + data[end:])
+' "${_np_script}" || printError "could not rewrite the shebang in ${_np_script}"
+    chtag -tc ISO8859-1 "${_np_script}"
+    chmod +x "${_np_script}"
+  done
+
+  # Prove it: a shebang that does not resolve fails only in a consumer's build.
+  if [ -x "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" ]; then
+    "${ZOPEN_INSTALL_DIR}/lib/python/bin/numpy-config" --version > /dev/null 2>&1 \
+      || printError "numpy-config does not run after rewriting its shebang"
+  fi
   return 0
 }
 
